@@ -19,7 +19,7 @@ void randombytes(unsigned char *buf, unsigned long long len) {
 // ==========================================
 // 1. 全局配置与状态（v31.0 全新重构版：已移除变声，精简链路 + 统一同步）
 // ==========================================
-#define KP_VERSION      @"v34.3"
+#define KP_VERSION      @"v34.4"
 #define EQ10_BANDS      10
 #define MAX_CHANNELS    8
 #define REVERB_CH       2
@@ -2987,7 +2987,12 @@ static void kp_hook_pk_setRemote(id self, SEL _cmd, id desc, void (^handler)(NSE
                 NSInteger n = 0;
                 NSString *det = kp_sdp_audio_detail(sdp, &n);
                 kp_log(@"[2SSRC] 远端 answer m=audio 数量=%ld | %@", (long)n, det);
-                if ([dir isEqualToString:@"sendrecv"] || [dir isEqualToString:@"sendonly"]) wantSecond = YES;
+                // 只有“发布态 + answer=sendrecv”才建；answer=sendonly 是订阅态，绝不建
+                if (pub && [dir isEqualToString:@"sendrecv"]) {
+                    wantSecond = YES;
+                } else if ([dir isEqualToString:@"sendonly"] || [dir isEqualToString:@"recvonly"]) {
+                    kp_log(@"[2SSRC] answer=%@ 发布态=%d，属订阅态，不建第二条", dir, pub ? 1 : 0);
+                }
             }
             BOOL changed = ![st[@"lastAnswer"] isEqualToString:dir];
             if (changed) {
@@ -3006,23 +3011,38 @@ static void kp_hook_pk_setRemote(id self, SEL _cmd, id desc, void (^handler)(NSE
         if (orig_pk_setRemote) orig_pk_setRemote(self, _cmd, desc, handler);
         return;
     }
-    // 触发点二：answer=sendrecv，等 answer 真正应用完再建第二条
+    // 触发点二：必须 pub=YES 且 answer=sendrecv；answer=sendonly 是订阅态，不建
     void (^userHandler)(NSError *) = handler;
     orig_pk_setRemote(self, _cmd, desc, ^(NSError *err) {
+        if (userHandler) userHandler(err);
         @try {
             NSMutableDictionary *st = kp_pk_state(self, YES);
-            if (![st[@"secondTrackAttached"] boolValue]) {
-                kp_2ssrc_make_second(self, st[@"secondInit"], @"answer=sendrecv");
+            if ([st[@"secondTrackAttached"] boolValue] || [st[@"secondCreateScheduled"] boolValue]) return;
+            st[@"secondCreateScheduled"] = @YES;
+        } @catch (NSException *e) {}
+        // 不能在 WebRTC 的 setRemote 回调里直接 addTransceiver（重入协商会崩），
+        // 延后 0.2s 回主队列再建。
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            @try {
+                NSMutableDictionary *st = kp_pk_state(self, YES);
+                if ([st[@"secondTrackAttached"] boolValue]) return;
+                id signaling = nil;
+                @try { signaling = [self valueForKey:@"signalingState"]; } @catch (NSException *e) {}
+                if ([signaling isKindOfClass:[NSString class]] && ![signaling isEqualToString:@"stable"]) {
+                    kp_log(@"[2SSRC] 延后建第二条时 signalingState=%@，跳过本次", signaling);
+                    st[@"secondCreateScheduled"] = @NO;
+                    return;
+                }
+                kp_2ssrc_make_second(self, st[@"secondInit"], @"answer=sendrecv(延时0.2s)");
                 id tr1 = nil;
                 @try { tr1 = [st[@"firstAudioTrRef"] nonretainedObjectValue]; } @catch (NSException *e) {}
                 id track1 = nil;
                 @try { track1 = [[tr1 valueForKey:@"sender"] valueForKey:@"track"]; } @catch (NSException *e) {}
-                if (track1) kp_2ssrc_attach_track(self, track1, @"answer=sendrecv");
+                if (track1) kp_2ssrc_attach_track(self, track1, @"answer=sendrecv(延时0.2s)");
+            } @catch (NSException *e) {
+                kp_log(@"[2SSRC] 延后建第二条异常：%@", e.reason);
             }
-        } @catch (NSException *e) {
-            kp_log(@"[2SSRC] answer 后建第二条异常：%@", e.reason);
-        }
-        if (userHandler) userHandler(err);
+        });
     });
 }
 
@@ -3036,14 +3056,14 @@ static id kp_hook_pk_addTrack(id self, SEL _cmd, id track, void (^handler)(NSErr
 }
 
 // ==========================================
-// v34.3：2SSRC 建轨时机重排
-// v34.2 教训：在 addTransceiver hook 里就建第二条 → 抓到 transceiver 但没抓到轨，
-// 日志只有 addTransceiver，没有“第二条 transceiver / setTrack”。
-// 现在只在两个触发点建第二条：
-//   1) 第一条 sender 真正 setTrack: 拿到 audio track（主路径）
-//   2) 第一次 answer=sendrecv/sendonly 且 answer 已应用（备路径）
-// 建完立刻 direction 2→0(sendrecv) 并打日志；同一条 track 用 setTrack: 挂到第二条。
-// PK 接收端从不 setTrack，天然不会走到这里。
+// v34.4：2SSRC 建轨时机 + 建法
+// v34.3 崩因：answer=sendonly（订阅态）被当成发布态，且在 setRemote 回调里直接
+// addTransceiver 重入协商，App 当场重启；setDirection: 又不生效，第二条永远 recvonly。
+// 现在：
+//   1) 只有 pub=YES 且 answer=sendrecv 才建；sendonly/recvonly 一律当订阅态跳过
+//   2) 延后 0.2s 回主队列再 addTransceiver，且只在 signalingState=stable 时建
+//   3) 新建 RTCRtpTransceiverInit，先设 direction=0(sendrecv) 再建，不调 setDirection:
+//   4) 同一条 track 用 setTrack: 挂到第二条 sender
 // ==========================================
 static NSMapTable *g_senderPC = nil;   // RTCRtpSender -> RTCPeerConnection
 static NSMapTable *g_transPC  = nil;   // RTCRtpTransceiver -> RTCPeerConnection
@@ -3095,13 +3115,26 @@ static id kp_2ssrc_make_second(id pc, id init, NSString *why) {
             kp_log(@"[2SSRC] 当前 PC 不支持 addTransceiverOfType:init:，无法追加");
             return nil;
         }
-        if (!init) {
-            Class initCls = objc_getClass("RTCRtpTransceiverInit");
-            init = initCls ? [[initCls alloc] init] : nil;
+        // v34.4：不复用第一条的 init（它的 direction=2 recvonly，且 setDirection: 无效）。
+        // 新建 RTCRtpTransceiverInit，先把自己的 direction 设成 0(sendrecv) 再建。
+        NSInteger oldDir = -1;
+        if (init) { @try { oldDir = [[init valueForKey:@"direction"] integerValue]; } @catch (NSException *e) {} }
+        Class initCls = objc_getClass("RTCRtpTransceiverInit");
+        id freshInit = initCls ? [[initCls alloc] init] : nil;
+        BOOL dirSet = NO;
+        if (freshInit) {
+            @try {
+                [freshInit setValue:@0 forKey:@"direction"];
+                dirSet = YES;
+            } @catch (NSException *e) {
+                kp_log(@"[2SSRC] 新 init 设置 direction=0 失败：%@", e.reason);
+            }
         }
+        kp_log(@"[2SSRC] 用新 init：原 init direction=%ld → 新 init direction=0(sendrecv) dirSet=%d",
+               (long)oldDir, dirSet ? 1 : 0);
         // 关键：type 传 0（RTCRtpMediaTypeAudio），不传 @"audio"/@"soun"
-        id tr2 = orig_pk_addTransceiver ? orig_pk_addTransceiver(pc, addSel, 0, init)
-                                        : ((id (*)(id, SEL, NSInteger, id))objc_msgSend)(pc, addSel, 0, init);
+        id tr2 = orig_pk_addTransceiver ? orig_pk_addTransceiver(pc, addSel, 0, freshInit)
+                                        : ((id (*)(id, SEL, NSInteger, id))objc_msgSend)(pc, addSel, 0, freshInit);
         if (!tr2) {
             kp_log(@"[2SSRC] 第二条 audio transceiver 创建失败（触发=%@）", why);
             return nil;
@@ -3114,28 +3147,12 @@ static id kp_2ssrc_make_second(id pc, id init, NSString *why) {
 
         NSInteger d2 = -1;
         @try { d2 = [[tr2 valueForKey:@"direction"] integerValue]; } @catch (NSException *e) {}
-        kp_log(@"[2SSRC] 第二条 transceiver 已建 pc=%p tr=%p sender=%p 初始direction=%ld 触发=%@",
-               pc, tr2, sender2, (long)d2, why);
-
-        // 建完立刻把第二条从 recvonly(2) 强制切成 sendrecv(0)
-        if (d2 != 0) {
-            SEL dirSel = NSSelectorFromString(@"setDirection:");
-            if (orig_pk_setDirection) {
-                orig_pk_setDirection(tr2, dirSel, 0);
-            } else if ([tr2 respondsToSelector:dirSel]) {
-                ((void (*)(id, SEL, NSInteger))objc_msgSend)(tr2, dirSel, 0);
-                kp_log(@"[2SSRC] setDirection: 未挂钩，改直调兜底 tr=%p", tr2);
-            }
-            NSInteger after = -1;
-            @try { after = [[tr2 valueForKey:@"direction"] integerValue]; } @catch (NSException *e) {}
-            if (after == 0) {
-                kp_log(@"[2SSRC] 第二条 transceiver direction %ld→0(sendrecv) 已确认 after=%ld（触发=%@）",
-                       (long)d2, (long)after, why);
-            } else {
-                kp_log(@"[2SSRC] 第二条 transceiver direction 强制失败：仍为 %ld（触发=%@）", (long)after, why);
-            }
+        kp_log(@"[2SSRC] 第二条 transceiver 已建 pc=%p tr=%p sender=%p init预置direction=%ld 实际direction=%ld 触发=%@",
+               pc, tr2, sender2, (long)oldDir, (long)d2, why);
+        if (d2 == 0) {
+            kp_log(@"[2SSRC] 第二条 transceiver direction=0(sendrecv) 已确认（init 预置生效，不调 setDirection:）");
         } else {
-            kp_log(@"[2SSRC] 第二条 transceiver direction 已是 0(sendrecv)（触发=%@）", why);
+            kp_log(@"[2SSRC] 第二条 transceiver direction 仍为 %ld：本版 init.direction 未生效，属客户端限制", (long)d2);
         }
 
         // App 若先 setTrack 再建 transceiver，这里立刻把已有轨回填到第二条
@@ -3172,15 +3189,7 @@ static void kp_2ssrc_attach_track(id pc, id track, NSString *why) {
             kp_log(@"[2SSRC] 第二条 sender 不存在，无法挂轨（触发=%@）", why);
             return;
         }
-        // 第二条先切到 sendrecv(0)，不要停在首次的 recvonly(2)
-        if (orig_pk_setDirection) {
-            NSInteger cur = -2;
-            @try { cur = [[tr2 valueForKey:@"direction"] integerValue]; } @catch (NSException *e) {}
-            if (cur != 0 && cur != 1) {
-                orig_pk_setDirection(tr2, NSSelectorFromString(@"setDirection:"), 0);
-                kp_log(@"[2SSRC] 第二条 transceiver direction %ld→0(sendrecv)（触发=%@）", (long)cur, why);
-            }
-        }
+        // v34.4：不再调 setDirection:（本版 transceiver 不响应），方向由新 init 预置 0
         if (orig_pk_senderSetTrack) {
             orig_pk_senderSetTrack(sender2, NSSelectorFromString(@"setTrack:"), track);
             st[@"secondTrackAttached"] = @YES;
@@ -3204,24 +3213,6 @@ static void kp_2ssrc_attach_track(id pc, id track, NSString *why) {
     } @catch (NSException *e) {
         kp_log(@"[2SSRC] 挂第二条轨异常：%@", e.reason);
     }
-}
-
-static void kp_2ssrc_mirror_direction(id pc, NSInteger d, NSString *why) {
-    if (!g_secondSSRC || !pc) return;
-    if (d != 0 && d != 1) return;          // 只跟发送态（sendrecv/sendonly），不跟 recvonly
-    @try {
-        NSMutableDictionary *st = kp_pk_state(pc, YES);
-        id tr2 = kp_2ssrc_second_tr(st);
-        if (!tr2) return;
-        SEL sel = NSSelectorFromString(@"setDirection:");
-        if (![tr2 respondsToSelector:sel]) return;
-        NSInteger cur = -1;
-        @try { cur = [[tr2 valueForKey:@"direction"] integerValue]; } @catch (NSException *e) {}
-        if (cur == d) return;
-        if (orig_pk_setDirection) orig_pk_setDirection(tr2, sel, d);
-        else ((void (*)(id, SEL, NSInteger))objc_msgSend)(tr2, sel, d);
-        kp_log(@"[2SSRC] 第二条 transceiver direction=%ld（跟随第一条，触发=%@）", (long)d, why);
-    } @catch (NSException *e) {}
 }
 
 static id kp_hook_pk_addTransceiver(id self, SEL _cmd, NSInteger type, id init) {
@@ -3276,13 +3267,6 @@ static BOOL kp_hook_pk_senderSetTrack(id self, SEL _cmd, id track) {
             } else if (second != self) {
                 kp_2ssrc_attach_track(pc, track, @"setTrack");
             }
-            id tr1 = nil;
-            @try { tr1 = [st[@"firstAudioTrRef"] nonretainedObjectValue]; } @catch (NSException *e) {}
-            if (tr1) {
-                NSInteger d1 = -1;
-                @try { d1 = [[tr1 valueForKey:@"direction"] integerValue]; } @catch (NSException *e) {}
-                kp_2ssrc_mirror_direction(pc, d1, @"setTrack");
-            }
             kp_log(@"[2SSRC] 房间 PC 发布态 setTrack sender=%p pc=%p", self, pc);
         }
     } @catch (NSException *e) {}
@@ -3308,15 +3292,8 @@ static void kp_hook_pk_setDirection(id self, SEL _cmd, NSInteger d) {
         if (g_pkProbeEnabled || g_secondSSRC) {
             id tr2 = nil;
             if (pc) { @try { tr2 = kp_2ssrc_second_tr(kp_pk_state(pc, YES)); } @catch (NSException *e) {} }
-            kp_log(@"[2SSRC] setDirection hook 命中 direction=%ld pc=%p isFirst=%d isSecond=%d",
+            kp_log(@"[2SSRC] setDirection hook 命中 direction=%ld pc=%p isFirst=%d isSecond=%d（仅记录，不跟随）",
                    (long)d, pc, (tr2 && tr2 != self) ? 0 : 1, (tr2 == self) ? 1 : 0);
-        }
-        if (g_secondSSRC && pc) {
-            NSMutableDictionary *st = kp_pk_state(pc, YES);
-            id tr2 = kp_2ssrc_second_tr(st);
-            if (tr2 && tr2 != self) {
-                kp_2ssrc_mirror_direction(pc, d, @"setDirection");
-            }
         }
     } @catch (NSException *e) {}
 }
