@@ -19,7 +19,7 @@ void randombytes(unsigned char *buf, unsigned long long len) {
 // ==========================================
 // 1. 全局配置与状态（v31.0 全新重构版：已移除变声，精简链路 + 统一同步）
 // ==========================================
-#define KP_VERSION      @"v31.0"
+#define KP_VERSION      @"v34.0"
 #define EQ10_BANDS      10
 #define MAX_CHANNELS    8
 #define REVERB_CH       2
@@ -51,6 +51,8 @@ static _Atomic float g_preGain           = 1.40f;   // v33：适度前级驱动�
 static _Atomic BOOL  g_forceDefaultMode  = YES;     // 强制将 VoiceChat 改为 Default，甩掉苹果通话模式压制
 static _Atomic BOOL  g_disableDucking    = YES;     // 关闭系统/WebRTC 自动闪避
 static _Atomic BOOL  g_understageEnabled = NO;      // 台下开麦：强开采集投递 + 强解本地静音（默认关，防热麦）
+static _Atomic BOOL  g_pkProbeEnabled    = YES;     // v34 PK 网关探测：SDP 方向 / 信令 configure 全量写日志（纯观测，默认开）
+static _Atomic BOOL  g_pkProbeActive     = NO;      // v34 主动探测：向 PK 网关补发 configure muted:false（默认关）
 
 static _Atomic BOOL  g_eq10Enabled       = YES;
 static const float kEq10Freqs[EQ10_BANDS] = {
@@ -124,6 +126,8 @@ static _Atomic int  g_hookState = 0;
 #define KEY_CLIP_LOOP       @"kaka_v31_clip_loop"
 #define KEY_UNDERSTAGE_ON   @"kaka_v31_understage_on"
 #define KEY_NOISE_GATE_ON   @"kaka_v33_gate_on"
+#define KEY_PK_PROBE_ON     @"kaka_v34_pk_probe_on"
+#define KEY_PK_PROBE_ACTIVE @"kaka_v34_pk_probe_active"
 
 static float g_dc_x1[MAX_CHANNELS] = {0};
 static float g_dc_y1[MAX_CHANNELS] = {0};
@@ -143,6 +147,8 @@ static float g_kvEnv        = 0.0f;  // KVDSP 浮点出口压缩包络（KPCusto
 static float g_kvGainSmooth = 1.0f;  // KVDSP 浮点出口平滑增益
 
 static void kp_log(NSString *fmt, ...);
+static void kp_pk_ws_tx_probe(id task, NSString *s);
+static void kp_pk_ws_rx_probe(id task, NSString *s);
 static void kp_rebuild_filter_bank(void);
 static void kp_update_ball(void);
 static void kp_sync_all_ui(void);
@@ -177,6 +183,8 @@ static void load_saved_settings(void) {
     if ([ud objectForKey:KEY_PRIORITY_LOUD]) g_priorityLoud     = [ud boolForKey:KEY_PRIORITY_LOUD];
     if ([ud objectForKey:KEY_CLIP_LOOP])     g_clipLoop         = [ud boolForKey:KEY_CLIP_LOOP];
     if ([ud objectForKey:KEY_UNDERSTAGE_ON]) g_understageEnabled = [ud boolForKey:KEY_UNDERSTAGE_ON];
+    if ([ud objectForKey:KEY_PK_PROBE_ON])     g_pkProbeEnabled = [ud boolForKey:KEY_PK_PROBE_ON];
+    if ([ud objectForKey:KEY_PK_PROBE_ACTIVE]) g_pkProbeActive  = [ud boolForKey:KEY_PK_PROBE_ACTIVE];
     if ([ud objectForKey:KEY_NOISE_GATE_ON]) g_noiseGateEnabled = [ud boolForKey:KEY_NOISE_GATE_ON];
 
     NSArray *eqArr = [ud arrayForKey:KEY_EQ10_GAINS];
@@ -231,6 +239,8 @@ static void save_current_settings(void) {
     [ud setBool:g_clipLoop         forKey:KEY_CLIP_LOOP];
     [ud setBool:g_understageEnabled forKey:KEY_UNDERSTAGE_ON];
     [ud setBool:g_noiseGateEnabled forKey:KEY_NOISE_GATE_ON];
+    [ud setBool:g_pkProbeEnabled   forKey:KEY_PK_PROBE_ON];
+    [ud setBool:g_pkProbeActive    forKey:KEY_PK_PROBE_ACTIVE];
 
     NSMutableArray *eqArr = [NSMutableArray arrayWithCapacity:EQ10_BANDS];
     for (int i = 0; i < EQ10_BANDS; i++) {
@@ -2654,6 +2664,9 @@ static void kp_hook_ws_sendMsg(id self, SEL _cmd, NSURLSessionWebSocketMessage *
             kp_log(@"[understage-ws] 已改写信令 muted:true -> false");
         }
     }
+    if (message && message.type == NSURLSessionWebSocketMessageTypeString && message.string.length > 0) {
+        kp_pk_ws_tx_probe(self, message.string);
+    }
     if (orig_ws_sendMsg) {
         orig_ws_sendMsg(self, _cmd, outMsg, completionHandler);
     }
@@ -2741,6 +2754,9 @@ static void kp_hook_ws_recvMsg(id self, SEL _cmd, void (^completionHandler)(NSUR
                 kp_log(@"[ROOM-WS-RX] %@", clip);
             }
         }
+        if (!err && msg && msg.type == NSURLSessionWebSocketMessageTypeString && msg.string.length > 0) {
+            kp_pk_ws_rx_probe(self, msg.string);
+        }
         if (completionHandler) completionHandler(msg, err);
     };
     if (orig_ws_recvMsg) orig_ws_recvMsg(self, _cmd, wrapped);
@@ -2810,6 +2826,224 @@ static void kp_setup_room_monitor_hooks(void) {
         });
         dispatch_resume(statsTimer);
     }
+}
+
+// ==========================================
+// v34 PK 网关探测（依据 deliver/PK网关越权发布逆向与验证.md）
+// 官方 PK 接收端 = RecvOnly + 无本地音轨 + 不发 configure。
+// 本模块纯观测，不改官方行为；三条判据全部写进 rack.log：
+//   1) 本地 offer / 远端 answer 的 m=audio 方向（recvonly / sendrecv）
+//   2) answer 里 a=ssrc 行数
+//   3) PK 连接上是否出现 addTrack（本地音轨挂载）
+// 捕获到原生 WS 的 join 帧时，额外记录 ticket / configure 回包。
+// ==========================================
+static NSMapTable *g_pkPCState = nil;    // PC -> {isPK,lastOffer,lastAnswer}
+static NSMapTable *g_pkWSTasks = nil;    // ws task -> {url,ticket,configureSent}
+
+// 提取 SDP 里 m=audio 段的方向与 a=ssrc 行数
+static NSString *kp_pk_audio_summary(NSString *sdp, NSString **outMline, int *outSsrc) {
+    if (![sdp isKindOfClass:[NSString class]] || sdp.length == 0) return @"none";
+    NSArray<NSString *> *lines = [sdp componentsSeparatedByString:@"\n"];
+    BOOL inAudio = NO;
+    NSString *dir = @"none", *mline = @"";
+    int ssrc = 0;
+    for (NSString *raw in lines) {
+        NSString *l = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if ([l hasPrefix:@"m=audio"]) { inAudio = YES; mline = l; continue; }
+        if (inAudio && [l hasPrefix:@"m="]) break;
+        if (!inAudio) continue;
+        if ([l hasPrefix:@"a=recvonly"])       dir = @"recvonly";
+        else if ([l hasPrefix:@"a=sendrecv"])  dir = @"sendrecv";
+        else if ([l hasPrefix:@"a=sendonly"])  dir = @"sendonly";
+        else if ([l hasPrefix:@"a=inactive"])  dir = @"inactive";
+        else if ([l hasPrefix:@"a=ssrc:"])     ssrc++;
+    }
+    if (outMline) *outMline = mline;
+    if (outSsrc)  *outSsrc = ssrc;
+    return dir;
+}
+
+static NSMutableDictionary *kp_pk_state(id pc, BOOL create) {
+    if (!g_pkPCState) {
+        g_pkPCState = [NSMapTable mapTableWithKeyOptions:NSPointerFunctionsWeakMemory
+                                             valueOptions:NSPointerFunctionsStrongMemory];
+    }
+    NSMutableDictionary *st = [g_pkPCState objectForKey:pc];
+    if (!st && create) {
+        st = [NSMutableDictionary dictionary];
+        [g_pkPCState setObject:st forKey:pc];
+    }
+    return st;
+}
+
+static NSString *kp_pk_desc_sdp(id desc) {
+    if (!desc) return nil;
+    @try {
+        id v = [desc valueForKey:@"sdp"];
+        if ([v isKindOfClass:[NSString class]]) return v;
+    } @catch (NSException *e) {}
+    return nil;
+}
+
+static void (*orig_pk_setLocal)(id, SEL, id, void (^)(NSError *))  = NULL;
+static void (*orig_pk_setRemote)(id, SEL, id, void (^)(NSError *)) = NULL;
+static id   (*orig_pk_addTrack)(id, SEL, id, void (^)(NSError *))  = NULL;
+
+static void kp_hook_pk_setLocal(id self, SEL _cmd, id desc, void (^handler)(NSError *)) {
+    if (g_pkProbeEnabled) {
+        @try {
+            NSString *sdp = kp_pk_desc_sdp(desc);
+            NSString *ml = @""; int ssrc = 0;
+            NSString *dir = kp_pk_audio_summary(sdp, &ml, &ssrc);
+            NSMutableDictionary *st = kp_pk_state(self, YES);
+            BOOL pk = [st[@"isPK"] boolValue];
+            if ([dir isEqualToString:@"recvonly"] && !pk) {
+                pk = YES;
+                st[@"isPK"] = @YES;
+                kp_log(@"[PK-PROBE] ★ 本地 offer audio=recvonly → 判定为 PK 接收端 pc=%p", self);
+                kp_log(@"[PK-PROBE] offer m-line=%@", (ml.length > 140 ? [ml substringToIndex:140] : ml));
+                kp_log(@"[PK-PROBE] 官方语义确认：只收不发（无本地音轨 / 不发 configure）");
+            }
+            BOOL changed = ![st[@"lastOffer"] isEqualToString:dir];
+            if (pk || changed) {
+                st[@"lastOffer"] = dir ?: @"none";
+                kp_log(@"[PK-PROBE] 本地 offer audio=%@ ssrc行=%d pk=%d", dir, ssrc, pk ? 1 : 0);
+            }
+        } @catch (NSException *e) {}
+    }
+    if (orig_pk_setLocal) orig_pk_setLocal(self, _cmd, desc, handler);
+}
+
+static void kp_hook_pk_setRemote(id self, SEL _cmd, id desc, void (^handler)(NSError *)) {
+    if (g_pkProbeEnabled) {
+        @try {
+            NSString *sdp = kp_pk_desc_sdp(desc);
+            NSString *ml = @""; int ssrc = 0;
+            NSString *dir = kp_pk_audio_summary(sdp, &ml, &ssrc);
+            NSMutableDictionary *st = kp_pk_state(self, YES);
+            BOOL pk = [st[@"isPK"] boolValue];
+            BOOL changed = ![st[@"lastAnswer"] isEqualToString:dir];
+            if (pk || changed) {
+                st[@"lastAnswer"] = dir ?: @"none";
+                kp_log(@"[PK-PROBE] 远端 answer audio=%@ ssrc行=%d pk=%d", dir, ssrc, pk ? 1 : 0);
+                if (pk && [dir isEqualToString:@"recvonly"]) {
+                    kp_log(@"[PK-PROBE] 结论A：服务端按 ticket 角色拦截，PK 仍然只能收（无越权口）");
+                } else if (pk && [dir isEqualToString:@"sendrecv"]) {
+                    kp_log(@"[PK-PROBE] 结论B：answer 放行 sendrecv，SDP 协商已开上行；还需 B 房听众验收");
+                    if (ssrc > 0) kp_log(@"[PK-PROBE] answer 含 a=ssrc 行 %d 条（有 SSRC 不等于媒体通）", ssrc);
+                } else if (pk) {
+                    kp_log(@"[PK-PROBE] 结论C：answer 方向=%@，需结合 configure 回包判断", dir);
+                }
+            }
+        } @catch (NSException *e) {}
+    }
+    if (orig_pk_setRemote) orig_pk_setRemote(self, _cmd, desc, handler);
+}
+
+static id kp_hook_pk_addTrack(id self, SEL _cmd, id track, void (^handler)(NSError *)) {
+    if (g_pkProbeEnabled) {
+        @try {
+            NSMutableDictionary *st = kp_pk_state(self, NO);
+            if ([st[@"isPK"] boolValue]) {
+                kp_log(@"[PK-PROBE] ⚠️ PK 连接上出现 addTrack：本地音轨挂载（越权发布第一步）");
+            }
+        } @catch (NSException *e) {}
+    }
+    return orig_pk_addTrack ? orig_pk_addTrack(self, _cmd, track, handler) : nil;
+}
+
+// ---- 信令层：从 WS 帧里抓 PK ticket / configure 回包 ----
+static NSString *kp_pk_json_str(NSString *s, NSString *key) {
+    if (![s isKindOfClass:[NSString class]]) return nil;
+    NSString *needle = [NSString stringWithFormat:@"\"%@\":\"", key];
+    NSRange r = [s rangeOfString:needle];
+    if (r.location == NSNotFound) return nil;
+    NSUInteger start = r.location + r.length;
+    if (start >= s.length) return nil;
+    NSRange tail = [s rangeOfString:@"\"" options:0 range:NSMakeRange(start, s.length - start)];
+    if (tail.location == NSNotFound) return nil;
+    return [s substringWithRange:NSMakeRange(start, tail.location - start)];
+}
+
+static void kp_pk_ws_tx_probe(id task, NSString *s) {
+    if (!g_pkProbeEnabled || ![s isKindOfClass:[NSString class]]) return;
+    if (![s containsString:@"\"op\":\"join\""] || ![s containsString:@"ticket"]) return;
+    @try {
+        if (!g_pkWSTasks) {
+            g_pkWSTasks = [NSMapTable mapTableWithKeyOptions:NSPointerFunctionsWeakMemory
+                                                valueOptions:NSPointerFunctionsStrongMemory];
+        }
+        NSMutableDictionary *st = [g_pkWSTasks objectForKey:task];
+        if (!st) { st = [NSMutableDictionary dictionary]; [g_pkWSTasks setObject:st forKey:task]; }
+
+        NSString *ticket = kp_pk_json_str(s, @"ticket");
+        NSString *url = nil;
+        @try {
+            NSURLRequest *req = [task valueForKey:@"originalRequest"];
+            url = req.URL.absoluteString;
+        } @catch (NSException *e) {}
+        st[@"ticket"] = ticket ?: @"";
+        st[@"url"] = url ?: @"";
+        kp_log(@"[PK-PROBE] 捕获 PK join → gateway=%@ ticket=%.12s…(len=%lu)",
+               url.length ? url : @"?", ticket.length ? ticket.UTF8String : "", (unsigned long)ticket.length);
+
+        if (g_pkProbeActive && ![st[@"configureSent"] boolValue]) {
+            st[@"configureSent"] = @YES;
+            NSString *reqId = [NSString stringWithFormat:@"pkprobe-%lld",
+                               (long long)([[NSDate date] timeIntervalSince1970] * 1000)];
+            NSString *json = [NSString stringWithFormat:@"{\"op\":\"configure\",\"muted\":false,\"request_id\":\"%@\"}", reqId];
+            kp_log(@"[PK-PROBE] 主动探测：补发 configure muted:false request_id=%@", reqId);
+            id wsTask = task;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                if (!g_pkProbeActive) return;
+                NSURLSessionWebSocketMessage *m = [[NSURLSessionWebSocketMessage alloc] initWithString:json];
+                if (orig_ws_sendMsg) {
+                    orig_ws_sendMsg(wsTask, @selector(sendMessage:completionHandler:), m, ^(NSError *err) {
+                        kp_log(@"[PK-PROBE] configure 已发出，completion err=%@", err ? err.localizedDescription : @"nil");
+                    });
+                }
+            });
+        }
+    } @catch (NSException *e) {}
+}
+
+static void kp_pk_ws_rx_probe(id task, NSString *s) {
+    if (!g_pkProbeEnabled || ![s isKindOfClass:[NSString class]]) return;
+    BOOL interesting = ([s containsString:@"configured"] || [s containsString:@"listen_only"] ||
+                        [s containsString:@"publishing"]   || [s containsString:@"\"ready\""]   ||
+                        [s containsString:@"\"error\""]     || [s containsString:@"a=sendrecv"]   ||
+                        [s containsString:@"a=recvonly"]);
+    if (!interesting) return;
+    NSString *clip = s.length > 400 ? [[s substringToIndex:400] stringByAppendingString:@"…"] : s;
+    kp_log(@"[PK-PROBE] 信令RX %@", clip);
+}
+
+static void kp_setup_pk_probe_hooks(void) {
+    static BOOL hooked = NO;
+    if (hooked) return;
+    Class pcCls = objc_getClass("RTCPeerConnection");
+    if (!pcCls) return;
+    hooked = YES;
+
+    Method m1 = class_getInstanceMethod(pcCls, NSSelectorFromString(@"setLocalDescription:completionHandler:"));
+    if (m1 && !orig_pk_setLocal) {
+        orig_pk_setLocal = (void (*)(id, SEL, id, void (^)(NSError *)))method_getImplementation(m1);
+        method_setImplementation(m1, (IMP)kp_hook_pk_setLocal);
+    }
+
+    Method m2 = class_getInstanceMethod(pcCls, NSSelectorFromString(@"setRemoteDescription:completionHandler:"));
+    if (m2 && !orig_pk_setRemote) {
+        orig_pk_setRemote = (void (*)(id, SEL, id, void (^)(NSError *)))method_getImplementation(m2);
+        method_setImplementation(m2, (IMP)kp_hook_pk_setRemote);
+    }
+
+    Method m3 = class_getInstanceMethod(pcCls, NSSelectorFromString(@"addTrack:completionHandler:"));
+    if (m3 && !orig_pk_addTrack) {
+        orig_pk_addTrack = (id (*)(id, SEL, id, void (^)(NSError *)))method_getImplementation(m3);
+        method_setImplementation(m3, (IMP)kp_hook_pk_addTrack);
+    }
+
+    kp_log(@"[PK-PROBE] SDP 探针已挂载（setLocal/setRemote/addTrack），日志路径 Documents/KakaAudio/rack.log");
 }
 
 // ==========================================
@@ -3352,11 +3586,11 @@ static void kp_build_rack_page(CGFloat w) {
     UIScrollView *sv = [[UIScrollView alloc] initWithFrame:CGRectMake(0, KP_PAGE_Y, w, KP_PAGE_H)];
     sv.showsVerticalScrollIndicator = YES;
     sv.alwaysBounceVertical = YES;
-    sv.contentSize = CGSizeMake(w, 770);
+    sv.contentSize = CGSizeMake(w, 832);
     [g_panel addSubview:sv];
     g_pageRack = sv;
 
-    UIView *c = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, 770)];
+    UIView *c = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, 832)];
     [sv addSubview:c];
 
     UIColor *dim = [UIColor colorWithWhite:0.60 alpha:1.0];
@@ -3418,6 +3652,18 @@ static void kp_build_rack_page(CGFloat w) {
     kp_row_switch(c, y, w, @"房间与通道监听日志", g_roomMonitorEnabled, ^(BOOL on) {
         g_roomMonitorEnabled = on;
         kp_log(@"[ROOM-MON] 监听开关=%s", on ? "ON" : "OFF");
+    });
+    y += 30;
+    kp_row_switch(c, y, w, @"PK 网关探测（SDP/信令写日志）", g_pkProbeEnabled, ^(BOOL on) {
+        g_pkProbeEnabled = on;
+        save_current_settings();
+        kp_log(@"[PK-PROBE] 探测开关=%s", on ? "ON" : "OFF");
+    });
+    y += 30;
+    kp_row_switch(c, y, w, @"PK configure 主动探测（默认关）", g_pkProbeActive, ^(BOOL on) {
+        g_pkProbeActive = on;
+        save_current_settings();
+        kp_log(@"[PK-PROBE] 主动探测=%s（只对自己账号当前 PK 连接补发 configure）", on ? "ON" : "OFF");
     });
     y += 30;
     kp_row_switch(c, y, w, @"智能噪声门（静音省码率/防底噪占道）", g_noiseGateEnabled, ^(BOOL on) {
@@ -3908,6 +4154,7 @@ __attribute__((constructor)) static void kp_entry(void) {
     kp_setup_understage_hooks();
     kp_setup_ws_unmute_hook();
     kp_setup_room_monitor_hooks();
+    kp_setup_pk_probe_hooks();
     kp_reverb_reset();
     kp_lim_reset();
 
@@ -3930,6 +4177,7 @@ __attribute__((constructor)) static void kp_entry(void) {
             kp_setup_shield_hook();
             kp_setup_kaka_allow_hooks();
             kp_setup_understage_hooks();   // 防类晚加载，定时补挂
+            kp_setup_pk_probe_hooks();
             kp_shield_apply();
             if ((s == 3 && kp_senderHooked && kp_shieldHooked && kp_kakaAllowHooked) || ++tries > 90) {
                 [timer invalidate];
