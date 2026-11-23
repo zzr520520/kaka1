@@ -74,8 +74,6 @@ static _Atomic BOOL  g_mixDspEnabled     = YES;
 static _Atomic float g_bgmVolume         = 0.45f;
 static _Atomic BOOL  g_bgmOnly           = NO;    // v34.1 只播 BGM/SFX：麦克风路径置零，只留 mus
 static _Atomic BOOL  g_secondSSRC        = NO;    // v34.1 第二 SSRC 实验：房间 PC 在同一轮协商追加一条音频轨
-static __weak id      g_rtcFactory       = nil;  // 最近一次 RTCPeerConnectionFactory，用于建第二条轨
-static BOOL           g_secondSSRCApplied = NO;  // 第二 SSRC 只加一次（房间 PC）
 static _Atomic float g_sfxVolume         = 1.0f;
 static _Atomic BOOL  g_duckEnabled       = NO;
 static _Atomic float g_bgmDuckFloor      = 0.22f;
@@ -2811,7 +2809,6 @@ static void kp_setup_room_monitor_hooks(void) {
                 IMP origPc = method_getImplementation(mPc);
                 method_setImplementation(mPc, imp_implementationWithBlock(^id(id _s, id cfg, id cons, id del) {
                     id pc = ((id (*)(id, SEL, id, id, id))origPc)(_s, pcSel, cfg, cons, del);
-                    g_rtcFactory = _s;
                     if (!g_allPeerConns) g_allPeerConns = [NSHashTable weakObjectsHashTable];
                     if (pc) [g_allPeerConns addObject:pc];
                     kp_log(@"[ROOM-MON] 已记录 RTCPeerConnection=%p (总数=%lu)", pc, (unsigned long)g_allPeerConns.count);
@@ -2913,18 +2910,18 @@ static void kp_hook_pk_setLocal(id self, SEL _cmd, id desc, void (^handler)(NSEr
             NSString *ml = @""; int ssrc = 0;
             NSString *dir = kp_pk_audio_summary(sdp, &ml, &ssrc);
             NSMutableDictionary *st = kp_pk_state(self, YES);
-            BOOL pk = [st[@"isPK"] boolValue];
-            if ([dir isEqualToString:@"recvonly"] && !pk) {
-                pk = YES;
-                st[@"isPK"] = @YES;
-                kp_log(@"[PK-PROBE] ★ 本地 offer audio=recvonly → 判定为 PK 接收端 pc=%p", self);
+            st[@"offerDir"] = dir ?: @"none";
+            if ([dir isEqualToString:@"recvonly"]) {
+                kp_log(@"[PK-PROBE] 本地 offer audio=recvonly（订阅态：房间首轮与 PK 接收端都会这样，不做 PK 判定） pc=%p", self);
                 kp_log(@"[PK-PROBE] offer m-line=%@", (ml.length > 140 ? [ml substringToIndex:140] : ml));
-                kp_log(@"[PK-PROBE] 官方语义确认：只收不发（无本地音轨 / 不发 configure）");
+            } else {
+                st[@"pub"] = @YES;
+                kp_log(@"[PK-PROBE] 本地 offer audio=%@（进入上行/发布态） pc=%p", dir, self);
             }
             BOOL changed = ![st[@"lastOffer"] isEqualToString:dir];
-            if (pk || changed) {
+            if (changed) {
                 st[@"lastOffer"] = dir ?: @"none";
-                kp_log(@"[PK-PROBE] 本地 offer audio=%@ ssrc行=%d pk=%d", dir, ssrc, pk ? 1 : 0);
+                kp_log(@"[PK-PROBE] 本地 offer audio=%@ ssrc行=%d pub=%d", dir, ssrc, [st[@"pub"] boolValue] ? 1 : 0);
             }
         } @catch (NSException *e) {}
     }
@@ -2938,18 +2935,15 @@ static void kp_hook_pk_setRemote(id self, SEL _cmd, id desc, void (^handler)(NSE
             NSString *ml = @""; int ssrc = 0;
             NSString *dir = kp_pk_audio_summary(sdp, &ml, &ssrc);
             NSMutableDictionary *st = kp_pk_state(self, YES);
-            BOOL pk = [st[@"isPK"] boolValue];
+            BOOL pub = [st[@"pub"] boolValue];
             BOOL changed = ![st[@"lastAnswer"] isEqualToString:dir];
-            if (pk || changed) {
+            if (changed) {
                 st[@"lastAnswer"] = dir ?: @"none";
-                kp_log(@"[PK-PROBE] 远端 answer audio=%@ ssrc行=%d pk=%d", dir, ssrc, pk ? 1 : 0);
-                if (pk && [dir isEqualToString:@"recvonly"]) {
-                    kp_log(@"[PK-PROBE] 结论A：服务端按 ticket 角色拦截，PK 仍然只能收（无越权口）");
-                } else if (pk && [dir isEqualToString:@"sendrecv"]) {
-                    kp_log(@"[PK-PROBE] 结论B：answer 放行 sendrecv，SDP 协商已开上行；还需 B 房听众验收");
-                    if (ssrc > 0) kp_log(@"[PK-PROBE] answer 含 a=ssrc 行 %d 条（有 SSRC 不等于媒体通）", ssrc);
-                } else if (pk) {
-                    kp_log(@"[PK-PROBE] 结论C：answer 方向=%@，需结合 configure 回包判断", dir);
+                kp_log(@"[PK-PROBE] 远端 answer audio=%@ ssrc行=%d 发布态=%d", dir, ssrc, pub ? 1 : 0);
+                if (pub && ([dir isEqualToString:@"sendrecv"] || [dir isEqualToString:@"sendonly"])) {
+                    kp_log(@"[PK-PROBE] 房间上行已协商：answer=%@ ssrc行=%d", dir, ssrc);
+                } else if (!pub && [dir isEqualToString:@"recvonly"]) {
+                    kp_log(@"[PK-PROBE] 只收连接：answer=recvonly（PK 接收端或房间订阅态）");
                 }
             }
         } @catch (NSException *e) {}
@@ -2960,59 +2954,150 @@ static void kp_hook_pk_setRemote(id self, SEL _cmd, id desc, void (^handler)(NSE
 static id kp_hook_pk_addTrack(id self, SEL _cmd, id track, void (^handler)(NSError *)) {
     if (g_pkProbeEnabled) {
         @try {
-            NSMutableDictionary *st = kp_pk_state(self, NO);
-            if ([st[@"isPK"] boolValue]) {
-                kp_log(@"[PK-PROBE] ⚠️ PK 连接上出现 addTrack：本地音轨挂载（越权发布第一步）");
-            }
+            kp_log(@"[PK-PROBE] addTrack 调用（本版 KAKA 房间走 addTransceiver，此处仅兜底记录）");
         } @catch (NSException *e) {}
     }
+    return orig_pk_addTrack ? orig_pk_addTrack(self, _cmd, track, handler) : nil;
+}
 
-    id ret = orig_pk_addTrack ? orig_pk_addTrack(self, _cmd, track, handler) : nil;
+// ==========================================
+// v34.1 修正：2SSRC 真实挂点
+// KAKA 房间不是 addTrack 加麦，而是 addTransceiver（先 recvonly）+ replaceTrack/改 direction。
+// 所以第二条轨在 replaceTrack 拿到第一条真实音频轨时追加，保证同一轮协商。
+// PK 接收端从不 replaceTrack，天然不会被加轨；不再用 offer 方向判 PK。
+// ==========================================
+static NSMapTable *g_senderPC = nil;   // RTCRtpSender -> RTCPeerConnection
+static NSMapTable *g_transPC  = nil;   // RTCRtpTransceiver -> RTCPeerConnection
+static id   (*orig_pk_addTransceiver)(id, SEL, id, id) = NULL;
+static void (*orig_pk_replaceTrack)(id, SEL, id, void (^)(NSError *)) = NULL;
+static void (*orig_pk_setDirection)(id, SEL, NSInteger) = NULL;
 
-    // ---- v34.1 第二 SSRC：只给房间 PC 的第一条音频轨加，且全局只加一次 ----
-    if (g_secondSSRC && !g_secondSSRCApplied) {
+static void kp_pk_map_transceiver(id pc, id tr) {
+    if (!pc || !tr) return;
+    if (!g_transPC) {
+        g_transPC = [NSMapTable mapTableWithKeyOptions:NSPointerFunctionsWeakMemory
+                                            valueOptions:NSPointerFunctionsWeakMemory];
+    }
+    [g_transPC setObject:pc forKey:tr];
+    id sender = nil;
+    @try { sender = [tr valueForKey:@"sender"]; } @catch (NSException *e) {}
+    if (sender) {
+        if (!g_senderPC) {
+            g_senderPC = [NSMapTable mapTableWithKeyOptions:NSPointerFunctionsWeakMemory
+                                                 valueOptions:NSPointerFunctionsWeakMemory];
+        }
+        [g_senderPC setObject:pc forKey:sender];
+    }
+}
+
+static void kp_2ssrc_attach_second(id pc, id track, NSString *why) {
+    if (!g_secondSSRC || !pc) return;
+    @try {
+        NSMutableDictionary *st = kp_pk_state(pc, YES);
+        if ([st[@"ssrcAdded"] boolValue]) return;
+        if ([st[@"isPK"] boolValue]) { kp_log(@"[2SSRC] 跳过：该 PC 已标记为 PK 接收端"); return; }
+
+        SEL addTr = NSSelectorFromString(@"addTransceiverOfType:init:");
+        if (![pc respondsToSelector:addTr]) {
+            kp_log(@"[2SSRC] 当前 PC 不支持 addTransceiverOfType:init:，无法追加");
+            return;
+        }
+        Class initCls = objc_getClass("RTCRtpTransceiverInit");
+        id initObj = initCls ? [[initCls alloc] init] : nil;
+
+        // 复用 App 自己传过的媒体类型字符串（AVMediaType 是 "soun"，不能想当然写 "audio"）
+        id mediaType = st[@"mediaType"];
+        if (![mediaType isKindOfClass:[NSString class]] || [(NSString *)mediaType length] == 0) mediaType = @"audio";
+        id tr2 = orig_pk_addTransceiver ? orig_pk_addTransceiver(pc, addTr, mediaType, initObj) : nil;
+        if (!tr2 && ![mediaType isEqualToString:@"soun"]) {
+            tr2 = orig_pk_addTransceiver ? orig_pk_addTransceiver(pc, addTr, @"soun", initObj) : nil;
+            if (tr2) kp_log(@"[2SSRC] mediaType=%@ 不被接受，改用 soun 成功", mediaType);
+        }
+        if (!tr2) { kp_log(@"[2SSRC] 第二条 audio transceiver 创建失败（mediaType=%@）", mediaType); return; }
+
+        kp_pk_map_transceiver(pc, tr2);
+        id sender2 = nil;
+        @try { sender2 = [tr2 valueForKey:@"sender"]; } @catch (NSException *e) {}
+        st[@"ssrcAdded"]     = @YES;
+        st[@"secondSender"]  = sender2;
+
+        if (sender2 && track) {
+            if (orig_pk_replaceTrack) {
+                orig_pk_replaceTrack(sender2, NSSelectorFromString(@"replaceTrack:completionHandler:"), track,
+                                     ^(NSError *err) {
+                    kp_log(@"[2SSRC] 第二条轨 replaceTrack %@（同一轮协商，期望 offer 出现 2 个 m=audio）",
+                           err ? err.localizedDescription : @"ok");
+                });
+            }
+        } else {
+            st[@"pendingSecond"] = @YES;
+            kp_log(@"[2SSRC] 第二条 transceiver 已建，等下次 replaceTrack 回填音频轨");
+        }
+        kp_log(@"[2SSRC] 触发点=%@ → 已追加第二条 audio transceiver（direction 保持默认 sendrecv）", why);
+    } @catch (NSException *e) {
+        kp_log(@"[2SSRC] 异常：%@", e.reason);
+    }
+}
+
+static id kp_hook_pk_addTransceiver(id self, SEL _cmd, id type, id init) {
+    id tr = orig_pk_addTransceiver ? orig_pk_addTransceiver(self, _cmd, type, init) : nil;
+    if (tr) {
+        kp_pk_map_transceiver(self, tr);
         @try {
             NSMutableDictionary *st = kp_pk_state(self, YES);
-            BOOL isAudio = YES;
-            @try { isAudio = [[track valueForKey:@"kind"] isEqualToString:@"audio"]; } @catch (NSException *e) {}
-            if (isAudio && ![st[@"isPK"] boolValue] && ![st[@"ssrcAdded"] boolValue]) {
-                id src = nil;
-                NSString *oldId = nil;
-                @try { src = [track valueForKey:@"source"]; } @catch (NSException *e) {}
-                @try { oldId = [track valueForKey:@"trackId"]; } @catch (NSException *e) {}
-                if (!src || src == [NSNull null]) src = nil;
-                if (oldId.length == 0) oldId = @"audio";
+            NSString *ts = [type isKindOfClass:[NSString class]] ? (NSString *)type : @"";
+            BOOL isAudioType = ([ts isEqualToString:@"soun"] ||
+                                [ts rangeOfString:@"audio" options:NSCaseInsensitiveSearch].location != NSNotFound);
+            if (isAudioType && !st[@"mediaType"]) st[@"mediaType"] = ts;
+        } @catch (NSException *e) {}
+        if (g_pkProbeEnabled) {
+            NSInteger d = -1;
+            @try { d = [[init valueForKey:@"direction"] integerValue]; } @catch (NSException *e) {}
+            kp_log(@"[2SSRC] addTransceiver type=%@ direction=%ld pc=%p tr=%p", type, (long)d, self, tr);
+        }
+    }
+    return tr;
+}
 
-                NSString *newId = [oldId stringByAppendingString:@"-ssrc2"];
-                id factory = g_rtcFactory;
-                id second = nil;
-                SEL selSrc = NSSelectorFromString(@"audioTrackWithSource:trackId:");
-                SEL selId  = NSSelectorFromString(@"audioTrackWithTrackId:");
+static void kp_hook_pk_replaceTrack(id self, SEL _cmd, id track, void (^handler)(NSError *)) {
+    @try {
+        id pc = g_senderPC ? [g_senderPC objectForKey:self] : nil;
+        BOOL isAudio = YES;
+        @try {
+            id kind = [track valueForKey:@"kind"];
+            if ([kind isKindOfClass:[NSString class]]) isAudio = [kind isEqualToString:@"audio"];
+        } @catch (NSException *e) {}
 
-                if (factory && src && [factory respondsToSelector:selSrc]) {
-                    second = ((id (*)(id, SEL, id, id))objc_msgSend)(factory, selSrc, src, newId);
-                } else if (factory && [factory respondsToSelector:selId]) {
-                    second = ((id (*)(id, SEL, id))objc_msgSend)(factory, selId, newId);
-                    kp_log(@"[2SSRC] 取不到原轨 source，退回 audioTrackWithTrackId（等于第二次采集，音色可能不同）");
-                }
-
-                if (second) {
-                    g_secondSSRCApplied = YES;
-                    st[@"ssrcAdded"] = @YES;
-                    kp_log(@"[2SSRC] 同一轮协商追加第二条音频轨 id=%@（期望 offer 出现 2 个 m=audio）", newId);
-                    if (orig_pk_addTrack) {
-                        orig_pk_addTrack(self, _cmd, second, ^(NSError *err) {
-                            kp_log(@"[2SSRC] 第二条 addTrack 完成 err=%@；看 answer 是否 2 个 m=audio 且第二条 sendrecv", err ? err.localizedDescription : @"nil");
+        if (pc && track && isAudio) {
+            NSMutableDictionary *st = kp_pk_state(pc, YES);
+            st[@"pub"] = @YES;
+            if (g_secondSSRC) {
+                if ([st[@"ssrcAdded"] boolValue] && [st[@"pendingSecond"] boolValue] && st[@"secondSender"]) {
+                    st[@"pendingSecond"] = @NO;
+                    if (orig_pk_replaceTrack) {
+                        orig_pk_replaceTrack(st[@"secondSender"], NSSelectorFromString(@"replaceTrack:completionHandler:"), track,
+                                             ^(NSError *err) {
+                            kp_log(@"[2SSRC] 第二条轨回填 replaceTrack %@", err ? err.localizedDescription : @"ok");
                         });
                     }
-                } else {
-                    kp_log(@"[2SSRC] 第二条轨道创建失败：factory=%@ source=%@（不做静音兜底）",
-                           factory ? @"ok" : @"nil", src ? @"ok" : @"nil");
+                } else if (![st[@"ssrcAdded"] boolValue]) {
+                    kp_2ssrc_attach_second(pc, track, @"replaceTrack");
                 }
             }
-        } @catch (NSException *e) {}
-    }
-    return ret;
+            kp_log(@"[2SSRC] 房间 PC 进入发布态（replaceTrack 拿到音频轨） pc=%p", pc);
+        }
+    } @catch (NSException *e) {}
+    if (orig_pk_replaceTrack) orig_pk_replaceTrack(self, _cmd, track, handler);
+}
+
+static void kp_hook_pk_setDirection(id self, SEL _cmd, NSInteger d) {
+    if (orig_pk_setDirection) orig_pk_setDirection(self, _cmd, d);
+    @try {
+        id pc = g_transPC ? [g_transPC objectForKey:self] : nil;
+        if (g_pkProbeEnabled) {
+            kp_log(@"[2SSRC] transceiver setDirection=%ld pc=%p", (long)d, pc);
+        }
+    } @catch (NSException *e) {}
 }
 
 // ---- 信令层：从 WS 帧里抓 PK ticket / configure 回包 ----
@@ -3106,7 +3191,28 @@ static void kp_setup_pk_probe_hooks(void) {
         method_setImplementation(m3, (IMP)kp_hook_pk_addTrack);
     }
 
-    kp_log(@"[PK-PROBE] SDP 探针已挂载（setLocal/setRemote/addTrack），日志路径 Documents/KakaAudio/rack.log");
+    // v34.1 修正：房间走 addTransceiver + replaceTrack，2SSRC 挂这里才打得到
+    Method m4 = class_getInstanceMethod(pcCls, NSSelectorFromString(@"addTransceiverOfType:init:"));
+    if (m4 && !orig_pk_addTransceiver) {
+        orig_pk_addTransceiver = (id (*)(id, SEL, id, id))method_getImplementation(m4);
+        method_setImplementation(m4, (IMP)kp_hook_pk_addTransceiver);
+    }
+
+    Class senderCls = objc_getClass("RTCRtpSender");
+    Method m5 = senderCls ? class_getInstanceMethod(senderCls, NSSelectorFromString(@"replaceTrack:completionHandler:")) : NULL;
+    if (m5 && !orig_pk_replaceTrack) {
+        orig_pk_replaceTrack = (void (*)(id, SEL, id, void (^)(NSError *)))method_getImplementation(m5);
+        method_setImplementation(m5, (IMP)kp_hook_pk_replaceTrack);
+    }
+
+    Class trCls = objc_getClass("RTCRtpTransceiver");
+    Method m6 = trCls ? class_getInstanceMethod(trCls, NSSelectorFromString(@"setDirection:")) : NULL;
+    if (m6 && !orig_pk_setDirection) {
+        orig_pk_setDirection = (void (*)(id, SEL, NSInteger))method_getImplementation(m6);
+        method_setImplementation(m6, (IMP)kp_hook_pk_setDirection);
+    }
+
+    kp_log(@"[PK-PROBE] 探针已挂载：setLocal/setRemote/addTrack/addTransceiver/replaceTrack/setDirection");
 }
 
 // ==========================================
@@ -3737,7 +3843,6 @@ static void kp_build_rack_page(CGFloat w) {
     y += 30;
     kp_row_switch(c, y, w, @"第二 SSRC 实验（仅测试房）", g_secondSSRC, ^(BOOL on) {
         g_secondSSRC = on;
-        if (!on) g_secondSSRCApplied = NO;
         save_current_settings();
         kp_log(@"[2SSRC] state=%s（重进房间生效；answer 只有 1 个 m=audio 就是服务端不受理）", on ? "ON" : "OFF");
     });
