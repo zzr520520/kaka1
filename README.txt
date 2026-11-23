@@ -1,6 +1,6 @@
-KakaVoicePro v34.4 源码包
+KakaVoicePro v34.5 源码包
 =========================
-版本：v34.4（2026-11-23 构建）
+版本：v34.5（2026-11-23 构建）
 基线：v33（智能噪声门 + 慢启动压缩 + 参数回调）
 
 文件清单
@@ -20,7 +20,7 @@ KakaVoicePro_v29.8.dylib  旧产物（v29.8，仅作对照）
 
 需要 iOS SDK，默认路径 /workspace/work/sdks/iPhoneOS15.6.sdk，可用环境变量覆盖：
 
-    SDK=/path/to/iPhoneOS15.6.sdk OUT=KakaVoicePro_v34.4.dylib ./build.sh
+    SDK=/path/to/iPhoneOS15.6.sdk OUT=KakaVoicePro_v34.5.dylib ./build.sh
 
 本版新增（v34）：PK 网关探测
 ---------------------------
@@ -67,7 +67,7 @@ APM 的 AGC/NS/瞬态抑制是全局硬锁，不受开关控制，底噪会明�
 `g_shieldLowOnly` 是 20% 档 —— 二次开发请沿用这三个名字。
 PK 探测新增：`g_pkProbeEnabled`（总开关）、`g_pkProbeActive`（主动探测）。
 
-v34.4 新增两个实验开关（默认都关）
+v34.5 新增两个实验开关（默认都关）
 --------------------------------
 1. 只播 BGM/MP3（麦克风置零）
    在 kp_process_pcm 里把 vL/vR 直接置 0，只保留 mus（BGM/SFX/片段）。
@@ -77,7 +77,7 @@ v34.4 新增两个实验开关（默认都关）
    音量用“伴奏音量”调到输出 RMS -12～-10dB（别到 -2dB，会炸 limiter）。
 
 2. 第二 SSRC 实验（仅测试房）
-   建第二条的条件（v34.4 收紧）：只认“发布态 pub=YES + answer=sendrecv”。
+   建第二条的条件（v34.5 收紧）：只认“发布态 pub=YES + answer=sendrecv”。
    answer=sendonly / recvonly 都是订阅态，一律跳过，不建。
    不在 setRemote 回调里直接 addTransceiver（会重入协商、当场闪退），
    改成 dispatch_after 0.2s 回主队列，且 signalingState=stable 时才建。
@@ -94,7 +94,7 @@ v34.4 新增两个实验开关（默认都关）
    - 本地 offer m=audio 数量=2 | mid=0 dir=sendrecv ssrc行=1 | mid=1 dir=sendrecv ssrc行=1
    缺任何一行，先修客户端，不要下“服务端拒绝”的结论。
 
-v34.4 结论门槛
+v34.5 结论门槛
 -------------
 必须同时满足：
    1) 第二条 transceiver 已建，且日志“实际direction=0”或“direction=0(sendrecv) 已确认”
@@ -102,3 +102,29 @@ v34.4 结论门槛
    3) offer 里 m=audio 数量=2，且两条都是 sendrecv/sendonly
 在此之后，answer 仍然是 inactive 或只有 1 个 m=audio，
 才能判定“单 PC 双 SSRC 被服务端拒”，再转多账号同房或单 SSRC 增益路线。
+
+v34.5 启动诊断（本次改动，用于定位闪退）
+-------------------------------------
+只动时序和日志，不动 2SSRC 逻辑：
+
+1. UI 构建延后：kp_build_ui 从 1.5s 改成 3.0s。
+2. [UI] 分段日志（4 条以上）：
+   [UI] kp_build_ui 被调用（即将 dispatch 到主队列）
+   [UI] 已进入主队列块，g_win=...
+   [UI] 设置/reverb/音效库加载完成
+   [UI] g_win 创建完成 ...（窗口类已实例化）
+   [UI] kp_build_panel 即将开始 / [UI] kp_build_panel 已返回（panel=...）
+   [UI] kp_tick 首调用完成，开始挂 0.1s 定时器 / [UI] UI 构建全部完成
+3. [BOOT] 心跳：hooks 那个 1.0s 定时器里每秒打一条
+   [BOOT] tick 1（state=.. sender=.. shield=.. kakaAllow=..）
+   [BOOT] tick 2 ...
+   tick 2 出现在 2 秒，早于 3 秒的 UI。判读：
+   - 只有 tick 1、没有 tick 2 → 崩在定时器/hook 安装，不是 UI
+   - tick 2 有、[UI] 那几条没有 → 崩在 dispatch_after 之后、UI 之前
+   - [UI] kp_build_panel 即将开始 有、已返回 没有 → 崩在 kp_build_panel 内部
+
+崩溃报告位置（iOS）
+------------------
+/var/mobile/Library/Logs/CrashReporter/ 下的 KAKA-*.ips
+或“设置 → 隐私与安全 → 分析与改进 → 分析数据”里找 KakaVoice-日期.ips。
+.ips 里 “exception” 与线程 0 的栈能直接看出是哪个函数，不用猜。

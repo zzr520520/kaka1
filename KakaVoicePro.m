@@ -19,7 +19,7 @@ void randombytes(unsigned char *buf, unsigned long long len) {
 // ==========================================
 // 1. 全局配置与状态（v31.0 全新重构版：已移除变声，精简链路 + 统一同步）
 // ==========================================
-#define KP_VERSION      @"v34.4"
+#define KP_VERSION      @"v34.5"
 #define EQ10_BANDS      10
 #define MAX_CHANNELS    8
 #define REVERB_CH       2
@@ -4481,11 +4481,15 @@ static void kp_log(NSString *fmt, ...) {
 }
 
 static void kp_build_ui(void) {
+    // v34.5：启动分段日志，用来判定崩在 UI 还是 3 秒之前
+    kp_log(@"[UI] kp_build_ui 被调用（即将 dispatch 到主队列）");
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (g_win) return;
+        kp_log(@"[UI] 已进入主队列块，g_win=%p", (void *)g_win);
+        if (g_win) { kp_log(@"[UI] g_win 已存在，本次跳过"); return; }
         load_saved_settings();
         kp_reverb_reset();
         kp_load_sfx_library();
+        kp_log(@"[UI] 设置/reverb/音效库加载完成");
 
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
             NSString *name = g_bgmName;
@@ -4504,6 +4508,7 @@ static void kp_build_ui(void) {
         });
 
         g_win = [[KPFloatWindowV31 alloc] initWithFrame:[UIScreen mainScreen].bounds];
+        kp_log(@"[UI] g_win 创建完成 %p（窗口类已实例化）", (void *)g_win);
         kp_attach_scene();
         g_win.windowLevel = UIWindowLevelAlert + 100;
         g_win.backgroundColor = [UIColor clearColor];
@@ -4531,9 +4536,13 @@ static void kp_build_ui(void) {
         [g_ball addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:g_ball action:panSel]];
         [g_win addSubview:g_ball];
 
+        kp_log(@"[UI] kp_build_panel 即将开始");
         kp_build_panel();
+        kp_log(@"[UI] kp_build_panel 已返回（panel=%p）", (void *)g_panel);
         kp_tick();
+        kp_log(@"[UI] kp_tick 首调用完成，开始挂 0.1s 定时器");
         g_tick = [NSTimer scheduledTimerWithTimeInterval:0.1 repeats:YES block:^(NSTimer *_Nonnull t) { kp_tick(); }];
+        kp_log(@"[UI] UI 构建全部完成");
     });
 }
 
@@ -4569,10 +4578,15 @@ __attribute__((constructor)) static void kp_entry(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         kp_log(@"dylib loaded %@", KP_VERSION);
         __block int tries = 0;
+        __block int bootTick = 0;
         [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *_Nonnull timer) {
+            bootTick += 1;
             int s = kp_install_hooks();
             if (s != g_hookState) kp_log(@"hooks state -> %d", s);
             g_hookState = s;
+            // v34.5：每秒心跳，用来区分「3 秒前就崩」和「UI 崩」
+            kp_log(@"[BOOT] tick %d（state=%d sender=%d shield=%d kakaAllow=%d）",
+                   bootTick, s, kp_senderHooked, kp_shieldHooked, kp_kakaAllowHooked);
             kp_setup_sender_hook();
             kp_setup_shield_hook();
             kp_setup_kaka_allow_hooks();
@@ -4589,7 +4603,7 @@ __attribute__((constructor)) static void kp_entry(void) {
         }];
     });
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         kp_build_ui();
     });
 }
