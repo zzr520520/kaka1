@@ -4484,7 +4484,7 @@ static void kp_build_ui(void) {
     // v34.5：启动分段日志，用来判定崩在 UI 还是 3 秒之前
     kp_log(@"[UI] kp_build_ui 被调用（即将 dispatch 到主队列）");
     dispatch_async(dispatch_get_main_queue(), ^{
-        kp_log(@"[UI] 已进入主队列块，g_win=%p", (void *)g_win);
+        kp_log(@"[UI] 已进入主队列块，g_win=%p", (__bridge void *)g_win);
         if (g_win) { kp_log(@"[UI] g_win 已存在，本次跳过"); return; }
         load_saved_settings();
         kp_reverb_reset();
@@ -4508,7 +4508,7 @@ static void kp_build_ui(void) {
         });
 
         g_win = [[KPFloatWindowV31 alloc] initWithFrame:[UIScreen mainScreen].bounds];
-        kp_log(@"[UI] g_win 创建完成 %p（窗口类已实例化）", (void *)g_win);
+        kp_log(@"[UI] g_win 创建完成 %p（窗口类已实例化）", (__bridge void *)g_win);
         kp_attach_scene();
         g_win.windowLevel = UIWindowLevelAlert + 100;
         g_win.backgroundColor = [UIColor clearColor];
@@ -4538,7 +4538,7 @@ static void kp_build_ui(void) {
 
         kp_log(@"[UI] kp_build_panel 即将开始");
         kp_build_panel();
-        kp_log(@"[UI] kp_build_panel 已返回（panel=%p）", (void *)g_panel);
+        kp_log(@"[UI] kp_build_panel 已返回（panel=%p）", (__bridge void *)g_panel);
         kp_tick();
         kp_log(@"[UI] kp_tick 首调用完成，开始挂 0.1s 定时器");
         g_tick = [NSTimer scheduledTimerWithTimeInterval:0.1 repeats:YES block:^(NSTimer *_Nonnull t) { kp_tick(); }];
