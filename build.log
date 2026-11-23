@@ -1,0 +1,47 @@
+KakaVoicePro.m:3692:70: warning: 'UIDocumentPickerModeImport' is deprecated: first deprecated in iOS 14.0 - Use appropriate initializers instead [-Wdeprecated-declarations]
+ 3692 |                                                               inMode:UIDocumentPickerModeImport];
+      |                                                                      ^
+/tmp/sdks/iPhoneOS16.5.sdk/System/Library/Frameworks/UIKit.framework/Headers/UIDocumentPickerViewController.h:30:29: note: 'UIDocumentPickerMode' has been explicitly marked deprecated here
+   30 | typedef NS_ENUM(NSUInteger, UIDocumentPickerMode) {
+      |                             ^
+KakaVoicePro.m:3691:49: warning: 'initWithDocumentTypes:inMode:' is deprecated: first deprecated in iOS 14.0 [-Wdeprecated-declarations]
+ 3691 |         [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[@"public.audio"]
+      |                                                 ^~~~~~~~~~~~~~~~~~~~~
+      |                                                 use initForOpeningContentTypes:asCopy: or initForOpeningContentTypes: instead
+/tmp/sdks/iPhoneOS16.5.sdk/System/Library/Frameworks/UIKit.framework/Headers/UIDocumentPickerViewController.h:41:1: note: 'initWithDocumentTypes:inMode:' has been explicitly marked deprecated here
+   41 | - (instancetype)initWithDocumentTypes:(NSArray <NSString *>*)allowedUTIs inMode:(UIDocumentPickerMode)mode NS_DESIGNATED_INITIALIZER API_DEPRECATED_WITH_REPLACEMENT("use initForOpeningContentTypes:asCopy: or initForOpeningContentTypes: instead", ios(8.0, 14.0)) API_UNAVAILABLE(tvos);
+      | ^
+KakaVoicePro.m:4487:58: error: cast of Objective-C pointer type 'KPFloatWindowV31 *' to C pointer type 'void *' requires a bridged cast
+ 4487 |         kp_log(@"[UI] 已进入主队列块，g_win=%p", (void *)g_win);
+      |                                                  ^~~~~~~~~~~~~
+KakaVoicePro.m:4487:59: note: use __bridge to convert directly (no change in ownership)
+ 4487 |         kp_log(@"[UI] 已进入主队列块，g_win=%p", (void *)g_win);
+      |                                                   ^
+      |                                                   __bridge 
+KakaVoicePro.m:4487:66: note: use CFBridgingRetain call to make an ARC object available as a +1 'void *'
+ 4487 |         kp_log(@"[UI] 已进入主队列块，g_win=%p", (void *)g_win);
+      |                                                          ^    
+      |                                                          CFBridgingRetain( )
+KakaVoicePro.m:4511:74: error: cast of Objective-C pointer type 'KPFloatWindowV31 *' to C pointer type 'void *' requires a bridged cast
+ 4511 |         kp_log(@"[UI] g_win 创建完成 %p（窗口类已实例化）", (void *)g_win);
+      |                                                             ^~~~~~~~~~~~~
+KakaVoicePro.m:4511:75: note: use __bridge to convert directly (no change in ownership)
+ 4511 |         kp_log(@"[UI] g_win 创建完成 %p（窗口类已实例化）", (void *)g_win);
+      |                                                              ^
+      |                                                              __bridge 
+KakaVoicePro.m:4511:82: note: use CFBridgingRetain call to make an ARC object available as a +1 'void *'
+ 4511 |         kp_log(@"[UI] g_win 创建完成 %p（窗口类已实例化）", (void *)g_win);
+      |                                                                     ^    
+      |                                                                     CFBridgingRetain( )
+KakaVoicePro.m:4541:64: error: cast of Objective-C pointer type 'UIView *' to C pointer type 'void *' requires a bridged cast
+ 4541 |         kp_log(@"[UI] kp_build_panel 已返回（panel=%p）", (void *)g_panel);
+      |                                                           ^~~~~~~~~~~~~~~
+KakaVoicePro.m:4541:65: note: use __bridge to convert directly (no change in ownership)
+ 4541 |         kp_log(@"[UI] kp_build_panel 已返回（panel=%p）", (void *)g_panel);
+      |                                                            ^
+      |                                                            __bridge 
+KakaVoicePro.m:4541:72: note: use CFBridgingRetain call to make an ARC object available as a +1 'void *'
+ 4541 |         kp_log(@"[UI] kp_build_panel 已返回（panel=%p）", (void *)g_panel);
+      |                                                                   ^      
+      |                                                                   CFBridgingRetain( )
+2 warnings and 3 errors generated.
