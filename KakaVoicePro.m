@@ -19,7 +19,7 @@ void randombytes(unsigned char *buf, unsigned long long len) {
 // ==========================================
 // 1. 全局配置与状态（v31.0 全新重构版：已移除变声，精简链路 + 统一同步）
 // ==========================================
-#define KP_VERSION      @"v34.0"
+#define KP_VERSION      @"v34.1"
 #define EQ10_BANDS      10
 #define MAX_CHANNELS    8
 #define REVERB_CH       2
@@ -72,6 +72,10 @@ static _Atomic float g_limiterCeiling    = 29800.0f; // 留出余量，避免混
 
 static _Atomic BOOL  g_mixDspEnabled     = YES;
 static _Atomic float g_bgmVolume         = 0.45f;
+static _Atomic BOOL  g_bgmOnly           = NO;    // v34.1 只播 BGM/SFX：麦克风路径置零，只留 mus
+static _Atomic BOOL  g_secondSSRC        = NO;    // v34.1 第二 SSRC 实验：房间 PC 在同一轮协商追加一条音频轨
+static __weak id      g_rtcFactory       = nil;  // 最近一次 RTCPeerConnectionFactory，用于建第二条轨
+static BOOL           g_secondSSRCApplied = NO;  // 第二 SSRC 只加一次（房间 PC）
 static _Atomic float g_sfxVolume         = 1.0f;
 static _Atomic BOOL  g_duckEnabled       = NO;
 static _Atomic float g_bgmDuckFloor      = 0.22f;
@@ -128,6 +132,8 @@ static _Atomic int  g_hookState = 0;
 #define KEY_NOISE_GATE_ON   @"kaka_v33_gate_on"
 #define KEY_PK_PROBE_ON     @"kaka_v34_pk_probe_on"
 #define KEY_PK_PROBE_ACTIVE @"kaka_v34_pk_probe_active"
+#define KEY_BGM_ONLY        @"kaka_v34_bgm_only"
+#define KEY_SECOND_SSRC     @"kaka_v34_second_ssrc"
 
 static float g_dc_x1[MAX_CHANNELS] = {0};
 static float g_dc_y1[MAX_CHANNELS] = {0};
@@ -185,6 +191,8 @@ static void load_saved_settings(void) {
     if ([ud objectForKey:KEY_UNDERSTAGE_ON]) g_understageEnabled = [ud boolForKey:KEY_UNDERSTAGE_ON];
     if ([ud objectForKey:KEY_PK_PROBE_ON])     g_pkProbeEnabled = [ud boolForKey:KEY_PK_PROBE_ON];
     if ([ud objectForKey:KEY_PK_PROBE_ACTIVE]) g_pkProbeActive  = [ud boolForKey:KEY_PK_PROBE_ACTIVE];
+    if ([ud objectForKey:KEY_BGM_ONLY])        g_bgmOnly        = [ud boolForKey:KEY_BGM_ONLY];
+    if ([ud objectForKey:KEY_SECOND_SSRC])     g_secondSSRC     = [ud boolForKey:KEY_SECOND_SSRC];
     if ([ud objectForKey:KEY_NOISE_GATE_ON]) g_noiseGateEnabled = [ud boolForKey:KEY_NOISE_GATE_ON];
 
     NSArray *eqArr = [ud arrayForKey:KEY_EQ10_GAINS];
@@ -241,6 +249,8 @@ static void save_current_settings(void) {
     [ud setBool:g_noiseGateEnabled forKey:KEY_NOISE_GATE_ON];
     [ud setBool:g_pkProbeEnabled   forKey:KEY_PK_PROBE_ON];
     [ud setBool:g_pkProbeActive    forKey:KEY_PK_PROBE_ACTIVE];
+    [ud setBool:g_bgmOnly          forKey:KEY_BGM_ONLY];
+    [ud setBool:g_secondSSRC       forKey:KEY_SECOND_SSRC];
 
     NSMutableArray *eqArr = [NSMutableArray arrayWithCapacity:EQ10_BANDS];
     for (int i = 0; i < EQ10_BANDS; i++) {
@@ -1508,6 +1518,12 @@ static inline void kp_process_pcm(int16_t *pcm, UInt32 frames, UInt32 chs, BOOL 
 
             vL *= gain;
             vR *= gain;
+
+            // v34.1 BGMOnly：麦克风路径彻底置零，只留 mus（BGM/SFX/片段）走同一个 SSRC
+            if (isPrimary && g_bgmOnly) {
+                vL = 0.0f;
+                vR = 0.0f;
+            }
 
             float mus = 0.0f;
             if (isPrimary) {
@@ -2795,6 +2811,7 @@ static void kp_setup_room_monitor_hooks(void) {
                 IMP origPc = method_getImplementation(mPc);
                 method_setImplementation(mPc, imp_implementationWithBlock(^id(id _s, id cfg, id cons, id del) {
                     id pc = ((id (*)(id, SEL, id, id, id))origPc)(_s, pcSel, cfg, cons, del);
+                    g_rtcFactory = _s;
                     if (!g_allPeerConns) g_allPeerConns = [NSHashTable weakObjectsHashTable];
                     if (pc) [g_allPeerConns addObject:pc];
                     kp_log(@"[ROOM-MON] 已记录 RTCPeerConnection=%p (总数=%lu)", pc, (unsigned long)g_allPeerConns.count);
@@ -2949,7 +2966,53 @@ static id kp_hook_pk_addTrack(id self, SEL _cmd, id track, void (^handler)(NSErr
             }
         } @catch (NSException *e) {}
     }
-    return orig_pk_addTrack ? orig_pk_addTrack(self, _cmd, track, handler) : nil;
+
+    id ret = orig_pk_addTrack ? orig_pk_addTrack(self, _cmd, track, handler) : nil;
+
+    // ---- v34.1 第二 SSRC：只给房间 PC 的第一条音频轨加，且全局只加一次 ----
+    if (g_secondSSRC && !g_secondSSRCApplied) {
+        @try {
+            NSMutableDictionary *st = kp_pk_state(self, YES);
+            BOOL isAudio = YES;
+            @try { isAudio = [[track valueForKey:@"kind"] isEqualToString:@"audio"]; } @catch (NSException *e) {}
+            if (isAudio && ![st[@"isPK"] boolValue] && ![st[@"ssrcAdded"] boolValue]) {
+                id src = nil;
+                NSString *oldId = nil;
+                @try { src = [track valueForKey:@"source"]; } @catch (NSException *e) {}
+                @try { oldId = [track valueForKey:@"trackId"]; } @catch (NSException *e) {}
+                if (!src || src == [NSNull null]) src = nil;
+                if (oldId.length == 0) oldId = @"audio";
+
+                NSString *newId = [oldId stringByAppendingString:@"-ssrc2"];
+                id factory = g_rtcFactory;
+                id second = nil;
+                SEL selSrc = NSSelectorFromString(@"audioTrackWithSource:trackId:");
+                SEL selId  = NSSelectorFromString(@"audioTrackWithTrackId:");
+
+                if (factory && src && [factory respondsToSelector:selSrc]) {
+                    second = ((id (*)(id, SEL, id, id))objc_msgSend)(factory, selSrc, src, newId);
+                } else if (factory && [factory respondsToSelector:selId]) {
+                    second = ((id (*)(id, SEL, id))objc_msgSend)(factory, selId, newId);
+                    kp_log(@"[2SSRC] 取不到原轨 source，退回 audioTrackWithTrackId（等于第二次采集，音色可能不同）");
+                }
+
+                if (second) {
+                    g_secondSSRCApplied = YES;
+                    st[@"ssrcAdded"] = @YES;
+                    kp_log(@"[2SSRC] 同一轮协商追加第二条音频轨 id=%@（期望 offer 出现 2 个 m=audio）", newId);
+                    if (orig_pk_addTrack) {
+                        orig_pk_addTrack(self, _cmd, second, ^(NSError *err) {
+                            kp_log(@"[2SSRC] 第二条 addTrack 完成 err=%@；看 answer 是否 2 个 m=audio 且第二条 sendrecv", err ? err.localizedDescription : @"nil");
+                        });
+                    }
+                } else {
+                    kp_log(@"[2SSRC] 第二条轨道创建失败：factory=%@ source=%@（不做静音兜底）",
+                           factory ? @"ok" : @"nil", src ? @"ok" : @"nil");
+                }
+            }
+        } @catch (NSException *e) {}
+    }
+    return ret;
 }
 
 // ---- 信令层：从 WS 帧里抓 PK ticket / configure 回包 ----
@@ -3586,11 +3649,11 @@ static void kp_build_rack_page(CGFloat w) {
     UIScrollView *sv = [[UIScrollView alloc] initWithFrame:CGRectMake(0, KP_PAGE_Y, w, KP_PAGE_H)];
     sv.showsVerticalScrollIndicator = YES;
     sv.alwaysBounceVertical = YES;
-    sv.contentSize = CGSizeMake(w, 832);
+    sv.contentSize = CGSizeMake(w, 892);
     [g_panel addSubview:sv];
     g_pageRack = sv;
 
-    UIView *c = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, 832)];
+    UIView *c = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, 892)];
     [sv addSubview:c];
 
     UIColor *dim = [UIColor colorWithWhite:0.60 alpha:1.0];
@@ -3664,6 +3727,19 @@ static void kp_build_rack_page(CGFloat w) {
         g_pkProbeActive = on;
         save_current_settings();
         kp_log(@"[PK-PROBE] 主动探测=%s（只对自己账号当前 PK 连接补发 configure）", on ? "ON" : "OFF");
+    });
+    y += 30;
+    kp_row_switch(c, y, w, @"只播 BGM/MP3（麦克风置零）", g_bgmOnly, ^(BOOL on) {
+        g_bgmOnly = on;
+        save_current_settings();
+        kp_log(@"[BGMOnly] state=%s（麦克风路径置零，只留伴奏/音效）", on ? "ON" : "OFF");
+    });
+    y += 30;
+    kp_row_switch(c, y, w, @"第二 SSRC 实验（仅测试房）", g_secondSSRC, ^(BOOL on) {
+        g_secondSSRC = on;
+        if (!on) g_secondSSRCApplied = NO;
+        save_current_settings();
+        kp_log(@"[2SSRC] state=%s（重进房间生效；answer 只有 1 个 m=audio 就是服务端不受理）", on ? "ON" : "OFF");
     });
     y += 30;
     kp_row_switch(c, y, w, @"智能噪声门（静音省码率/防底噪占道）", g_noiseGateEnabled, ^(BOOL on) {

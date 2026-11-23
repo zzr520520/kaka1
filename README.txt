@@ -1,6 +1,6 @@
-KakaVoicePro v34.0 源码包
+KakaVoicePro v34.1 源码包
 =========================
-版本：v34.0（2026-11-23 构建）
+版本：v34.1（2026-11-23 构建）
 基线：v33（智能噪声门 + 慢启动压缩 + 参数回调）
 
 文件清单
@@ -20,7 +20,7 @@ KakaVoicePro_v29.8.dylib  旧产物（v29.8，仅作对照）
 
 需要 iOS SDK，默认路径 /workspace/work/sdks/iPhoneOS15.6.sdk，可用环境变量覆盖：
 
-    SDK=/path/to/iPhoneOS15.6.sdk OUT=KakaVoicePro_v34.0.dylib ./build.sh
+    SDK=/path/to/iPhoneOS15.6.sdk OUT=KakaVoicePro_v34.1.dylib ./build.sh
 
 本版新增（v34）：PK 网关探测
 ---------------------------
@@ -66,3 +66,29 @@ APM 的 AGC/NS/瞬态抑制是全局硬锁，不受开关控制，底噪会明�
 `g_priorityLoud` 是霸麦开关，`g_shieldRemote` 是全屏蔽，
 `g_shieldLowOnly` 是 20% 档 —— 二次开发请沿用这三个名字。
 PK 探测新增：`g_pkProbeEnabled`（总开关）、`g_pkProbeActive`（主动探测）。
+
+v34.1 新增两个实验开关（默认都关）
+--------------------------------
+1. 只播 BGM/MP3（麦克风置零）
+   在 kp_process_pcm 里把 vL/vR 直接置 0，只保留 mus（BGM/SFX/片段）。
+   效果：整条上行只剩伴奏，但仍走同一个 PCM、同一个 Opus、同一个 SSRC，
+   服务端分不出这是 MP3——就是官方 BGM 那条路径。
+   用法：Documents/KakaAudio/BGM/ 放 MP3 → 面板开“伴奏 BGM” → 开本开关；
+   音量用“伴奏音量”调到输出 RMS -12～-10dB（别到 -2dB，会炸 limiter）。
+
+2. 第二 SSRC 实验（仅测试房）
+   在 RTCPeerConnection addTrack:completionHandler: 上做文章：
+   房间 PC 第一次 addTrack 音频轨时，用同一个 RTCPeerConnectionFactory、
+   同一个 source 再建一条 RTCAudioTrack（新 trackId），在原轨之后立刻追加，
+   争取让同一轮 offer 出现 2 个 m=audio、2 个独立 SSRC。
+   只在非 PK 的 PC 上加，且全局只加一次；关掉开关会重置标记，重进房间生效。
+
+   判读（都写在 rack.log）：
+   - [2SSRC] 同一轮协商追加第二条音频轨 → 说明钩子生效
+   - answer 出现 2 个 m=audio 且第二条 sendrecv/sendonly → 服务端可能按 SSRC 收
+   - answer 只有 1 个 m=audio，或第二条 recvonly → 服务端按 participant 去重，白加
+   - 如果 PK/Janus 网关一个 participant 只允许一条 audio m-line，第二条会直接进房失败
+
+   风险：先在测试房开，不要在主房试；双音验证用 1kHz/2kHz 分别喂两条轨，
+   让 B 房录音，两个音都在才说明按 SSRC 混，只听到一个说明被去重。
+   本实现两条轨共享同一个 source，信号内容相同，双音验证需要另配源。
