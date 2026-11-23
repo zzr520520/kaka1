@@ -1,6 +1,6 @@
-KakaVoicePro v34.2 源码包
+KakaVoicePro v34.3 源码包
 =========================
-版本：v34.2（2026-11-23 构建）
+版本：v34.3（2026-11-23 构建）
 基线：v33（智能噪声门 + 慢启动压缩 + 参数回调）
 
 文件清单
@@ -20,7 +20,7 @@ KakaVoicePro_v29.8.dylib  旧产物（v29.8，仅作对照）
 
 需要 iOS SDK，默认路径 /workspace/work/sdks/iPhoneOS15.6.sdk，可用环境变量覆盖：
 
-    SDK=/path/to/iPhoneOS15.6.sdk OUT=KakaVoicePro_v34.2.dylib ./build.sh
+    SDK=/path/to/iPhoneOS15.6.sdk OUT=KakaVoicePro_v34.3.dylib ./build.sh
 
 本版新增（v34）：PK 网关探测
 ---------------------------
@@ -67,7 +67,7 @@ APM 的 AGC/NS/瞬态抑制是全局硬锁，不受开关控制，底噪会明�
 `g_shieldLowOnly` 是 20% 档 —— 二次开发请沿用这三个名字。
 PK 探测新增：`g_pkProbeEnabled`（总开关）、`g_pkProbeActive`（主动探测）。
 
-v34.2 新增两个实验开关（默认都关）
+v34.3 新增两个实验开关（默认都关）
 --------------------------------
 1. 只播 BGM/MP3（麦克风置零）
    在 kp_process_pcm 里把 vL/vR 直接置 0，只保留 mus（BGM/SFX/片段）。
@@ -77,39 +77,26 @@ v34.2 新增两个实验开关（默认都关）
    音量用“伴奏音量”调到输出 RMS -12～-10dB（别到 -2dB，会炸 limiter）。
 
 2. 第二 SSRC 实验（仅测试房）
-   在 RTCPeerConnection addTrack:completionHandler: 上做文章：
-   房间 PC 第一次 addTrack 音频轨时，用同一个 RTCPeerConnectionFactory、
-   同一个 source 再建一条 RTCAudioTrack（新 trackId），在原轨之后立刻追加，
-   争取让同一轮 offer 出现 2 个 m=audio、2 个独立 SSRC。
-   只在非 PK 的 PC 上加，且全局只加一次；关掉开关会重置标记，重进房间生效。
+   不再在 addTransceiver hook 里建第二条。只在两个时机构建：
+   a) 第一条 RTCRtpSender 真正 setTrack: 拿到 audio track（主路径）
+   b) 第一次 answer=sendrecv/sendonly，且 answer 已应用（备路径）
+   建完立刻把第二条 direction 从 2(recvonly) 强制改成 0(sendrecv)，
+   再把第一条的同一个 track 用 setTrack: 挂到第二条 sender。
+   每条 PC 只建一次；重进房间就是新 PC，天然重置。
 
-   判读（都写在 rack.log）：
-   - [2SSRC] 同一轮协商追加第二条音频轨 → 说明钩子生效
-   - answer 出现 2 个 m=audio 且第二条 sendrecv/sendonly → 服务端可能按 SSRC 收
-   - answer 只有 1 个 m=audio，或第二条 recvonly → 服务端按 participant 去重，白加
-   - 如果 PK/Janus 网关一个 participant 只允许一条 audio m-line，第二条会直接进房失败
+   判读（都写在 rack.log，前缀 [2SSRC]）：
+   - hook install: ... setTrack=1 setDirection=1 → 两个钩子确实装上了
+   - 第二条 transceiver 已建 ... 初始direction=2 触发=setTrack
+   - 第二条 transceiver direction 2→0(sendrecv) 已确认 after=0
+   - 第二条 sender setTrack 完成 ... track=已挂（触发=setTrack）
+   - 本地 offer m=audio 数量=2 | mid=0 dir=sendrecv ssrc行=1 | mid=1 dir=sendrecv ssrc行=1
+   缺任何一行，先修客户端，不要下“服务端拒绝”的结论。
 
-   风险：先在测试房开，不要在主房试；双音验证用 1kHz/2kHz 分别喂两条轨，
-   让 B 房录音，两个音都在才说明按 SSRC 混，只听到一个说明被去重。
-   本实现两条轨共享同一个 source，信号内容相同，双音验证需要另配源。
-v34.2 修正（2SSRC 挂点第二次重做）
---------------------------------
-证据：KAKA 房间用 addTransceiverOfType:init:（type=(nil) 即 RTCRtpMediaTypeAudio=0，
-首次 direction=2 订阅）+ RTCRtpSender setTrack: 挂轨；WebRTC.framework 里
-只有 setTrack:，没有 replaceTrack:completionHandler:，所以旧钩子永不触发。
-
-现在：
-1. addTransceiver hook：isAudio（type==0）且 direction==2 时，立刻用原 IMP 再
-   addTransceiverOfType:init: 一次（type 传 0，复用 App 的 init），同一轮 offer
-   里就有 2 个 m=audio。
-2. setTrack hook：第一条音频 sender setTrack: 时，把同一条 track 也 setTrack:
-   到第二条 sender；第二条此时从 recvonly(2) 切到 sendrecv(0)。
-   （若第二条还没建，就先建再挂；replaceTrack 仅作为老版本保底。）
-3. setDirection hook：第一条转 sendrecv/sendonly 时，第二条跟着切，避免停在订阅态。
-4. 每条 PC 只加一次，重进房间是新 PC，天然重置。
-
-判读（rack.log）：
-- [2SSRC] 第二条 transceiver 已建 → 说明客户端真的建了第二条
-- [2SSRC] 第二条 sender setTrack 完成 → 说明同一条轨已挂到第二条
-- 没有这两行，offer 里只有 1 个 m=audio，不能说明服务端拒绝
-- answer 有 2 个 m=audio 且第二条 sendrecv/sendonly → 才进入“服务端是否按 SSRC 计权”的测试
+v34.3 结论门槛
+-------------
+必须同时满足：
+   1) 第二条 transceiver 已建，且日志确认 direction 0(sendrecv)
+   2) 第二条 sender 已挂同一条 track（track=已挂）
+   3) offer 里 m=audio 数量=2，且两条都是 sendrecv/sendonly
+在此之后，answer 仍然是 inactive 或只有 1 个 m=audio，
+才能判定“单 PC 双 SSRC 被服务端拒”，再转多账号同房或单 SSRC 增益路线。
