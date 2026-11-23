@@ -92,3 +92,20 @@ v34.1 新增两个实验开关（默认都关）
    风险：先在测试房开，不要在主房试；双音验证用 1kHz/2kHz 分别喂两条轨，
    让 B 房录音，两个音都在才说明按 SSRC 混，只听到一个说明被去重。
    本实现两条轨共享同一个 source，信号内容相同，双音验证需要另配源。
+v34.1 修正（2SSRC 挂点重做）
+--------------------------
+问题：原实现挂在 RTCPeerConnection addTrack:，但 KAKA 房间是
+addTransceiver（先 recvonly）+ replaceTrack/改 direction，addTrack 根本不会触发；
+同时用“首个 offer 是 recvonly”判 PK，把房间 PC 也误判成 PK 直接跳过。
+
+现在：
+1. 新增 hook：addTransceiverOfType:init:（记录 transceiver/sender -> PC 映射、
+   记录 App 实际用的 mediaType）、RTCRtpSender replaceTrack:completionHandler:
+   （拿到真实音频轨时触发）、RTCRtpTransceiver setDirection:（只记录方向变化）。
+2. 第二条轨在 replaceTrack 首次拿到音频轨时追加：同一个 PC 上
+   addTransceiverOfType:init:（默认 sendrecv）+ 把同一 track replaceTrack 到新 sender，
+   保证落在同一轮协商里。mediaType 复用 App 传过的值，兜底再试 soun。
+3. PK 判定不再用 offer 方向，也不再用 isPK 挡 2SSRC；PK 接收端从不 replaceTrack，
+   天然不会进到这个分支。房间 PC 每进一次房间就是新 PC，天然重置“只加一次”。
+4. 日志判据：出现 `[2SSRC] 触发点=replaceTrack → 已追加第二条 audio transceiver`
+   才说明客户端真的加了；只有这时 answer 里 1 个 m=audio 才叫“服务端不受理”。
